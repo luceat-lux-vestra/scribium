@@ -1,0 +1,5 @@
+id = "call-dot-prefixed-basic"
+feature = "dot-prefixed-call"
+compatibility_level = "Parsed"
+specification_source = "quarkdown-function-call-syntax"
+description = "Basic dot-prefixed function call with no arguments"

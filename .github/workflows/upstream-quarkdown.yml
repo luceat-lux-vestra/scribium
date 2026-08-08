@@ -1,0 +1,182 @@
+name: Quarkdown Upstream Watch
+
+on:
+  schedule:
+    - cron: '37 3 * * *'
+  workflow_dispatch:
+    inputs:
+      observed_tag:
+        description: 'Override observed tag for dry-run (e.g., v9.9.9)'
+        required: false
+        type: string
+      dry_run:
+        description: 'If true, print issue payload without creating issue'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: upstream-quarkdown
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+jobs:
+  watch:
+    name: Check Quarkdown upstream drift
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build upstream watcher
+        run: cargo build -p scribium-upstream-watch --locked
+
+      - name: Get latest stable release from GitHub
+        if: github.event.inputs.observed_tag == ''
+        id: get_release
+        run: |
+          RELEASE=$(gh api repos/iamgio/quarkdown/releases/latest --jq '.tag_name')
+          URL=$(gh api repos/iamgio/quarkdown/releases/latest --jq '.html_url')
+          echo "tag=$RELEASE" >> $GITHUB_OUTPUT
+          echo "url=$URL" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Use manual override for dry-run
+        if: github.event.inputs.observed_tag != ''
+        id: manual_override
+        env:
+          OBSERVED_TAG: ${{ github.event.inputs.observed_tag }}
+        run: |
+          echo "tag=$OBSERVED_TAG" >> $GITHUB_OUTPUT
+          echo "url=https://github.com/iamgio/quarkdown/releases/tag/$OBSERVED_TAG" >> $GITHUB_OUTPUT
+
+      - name: Determine observed release
+        id: observed
+        env:
+          GET_RELEASE_TAG: ${{ steps.get_release.outputs.tag }}
+          GET_RELEASE_URL: ${{ steps.get_release.outputs.url }}
+          MANUAL_TAG: ${{ steps.manual_override.outputs.tag }}
+          MANUAL_URL: ${{ steps.manual_override.outputs.url }}
+        run: |
+          if [ -n "$GET_RELEASE_TAG" ]; then
+            echo "tag=$GET_RELEASE_TAG" >> $GITHUB_OUTPUT
+            echo "url=$GET_RELEASE_URL" >> $GITHUB_OUTPUT
+          else
+            echo "tag=$MANUAL_TAG" >> $GITHUB_OUTPUT
+            echo "url=$MANUAL_URL" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run drift detection
+        id: drift
+        env:
+          OBSERVED_TAG: ${{ steps.observed.outputs.tag }}
+          OBSERVED_URL: ${{ steps.observed.outputs.url }}
+        run: |
+          RESULT=$(cargo run -p scribium-upstream-watch -- \
+            check-release \
+            --manifest docs/compatibility/quarkdown/upstream.toml \
+            --observed-tag "$OBSERVED_TAG" \
+            --observed-url "$OBSERVED_URL" \
+            --output json)
+          echo "result<<EOF" >> $GITHUB_OUTPUT
+          echo "$RESULT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Check if drift detected
+        id: check_drift
+        env:
+          DRIFT_RESULT: ${{ steps.drift.outputs.result }}
+        run: |
+          STATUS=$(echo "$DRIFT_RESULT" | jq -r '.status')
+          if [ "$STATUS" = "drift" ]; then
+            echo "drift=true" >> $GITHUB_OUTPUT
+          else
+            echo "drift=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Print dry-run result
+        if: github.event.inputs.dry_run == 'true'
+        env:
+          DRIFT_RESULT: ${{ steps.drift.outputs.result }}
+        run: |
+          echo "=== DRY RUN ==="
+          echo "Supported baseline: $(echo "$DRIFT_RESULT" | jq -r '.supported_baseline')"
+          echo "Observed tag: $(echo "$DRIFT_RESULT" | jq -r '.observed_tag')"
+          echo "Status: $(echo "$DRIFT_RESULT" | jq -r '.status')"
+          echo "Issue key: $(echo "$DRIFT_RESULT" | jq -r '.issue_key // "none"')"
+          echo ""
+          echo "Issue payload that would be created:"
+          echo "$DRIFT_RESULT" | jq -r '"[upstream] Quarkdown \(.observed_tag) detected (baseline \(.supported_baseline))"'
+          echo ""
+          echo "Supported baseline: $(echo "$DRIFT_RESULT" | jq -r '.supported_baseline')"
+          echo "Observed stable release: $(echo "$DRIFT_RESULT" | jq -r '.observed_tag')"
+          echo "Upstream release URL: $(echo "$DRIFT_RESULT" | jq -r '.observed_tag as $tag | "https://github.com/iamgio/quarkdown/releases/tag/" + $tag')"
+          echo "Detection source: scheduled upstream observer"
+          echo ""
+          echo "Checklist:"
+          echo "- [ ] Review permitted public specification changes"
+          echo "- [ ] Identify affected Scribium compatibility features"
+          echo "- [ ] Add independently authored conformance cases"
+          echo "- [ ] Perform black-box observations where necessary"
+          echo "- [ ] Document known divergences"
+          echo "- [ ] Implement required compatibility changes"
+          echo "- [ ] Run full conformance suite"
+          echo "- [ ] Update supported baseline only after verification"
+          echo ""
+          echo "Clean-room warning:"
+          echo "Do not inspect or translate Quarkdown implementation source while resolving this issue."
+          echo ""
+          echo "<!-- scribium-upstream-drift:quarkdown:$(echo "$DRIFT_RESULT" | jq -r '.observed_tag') -->"
+
+      - name: Manual override guard
+        if: github.event.inputs.observed_tag != '' && github.event.inputs.dry_run != 'true'
+        run: |
+          echo "Error: observed_tag override may only be used with dry_run=true"
+          echo "To create a real issue, do not use observed_tag override, or set dry_run=true for testing."
+          exit 1
+      - name: Check for existing issue
+        if: steps.check_drift.outputs.drift == 'true' && github.event.inputs.dry_run != 'true'
+        id: check_issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OBSERVED_TAG: ${{ steps.observed.outputs.tag }}
+        run: |
+          ISSUE_KEY="quarkdown:$OBSERVED_TAG"
+          MARKER="<!-- scribium-upstream-drift:$ISSUE_KEY -->"
+          # Write jq filter with embedded marker, handle null body, search open/closed
+          printf '%s\n' 'map(select((.body // "") | contains("<!-- scribium-upstream-drift:'"$ISSUE_KEY"' -->"))) | .[0].number // empty' > /tmp/jq_filter.jq
+          EXISTING=$(gh api --method GET "repos/${{ github.repository }}/issues" --paginate -F per_page=100 -F state=all --jq "$(cat /tmp/jq_filter.jq)" | head -1)
+          if [ -n "$EXISTING" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "issue_number=$EXISTING" >> $GITHUB_OUTPUT
+            echo "Issue #$EXISTING already exists for $ISSUE_KEY"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create drift issue
+        if: steps.check_drift.outputs.drift == 'true' && steps.check_issue.outputs.exists != 'true' && github.event.inputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OBSERVED_TAG: ${{ steps.observed.outputs.tag }}
+          DRIFT_RESULT: ${{ steps.drift.outputs.result }}
+        run: |
+          SUPPORTED_BASELINE=$(echo "$DRIFT_RESULT" | jq -r '.supported_baseline')
+          URL="https://github.com/iamgio/quarkdown/releases/tag/$OBSERVED_TAG"
+          ISSUE_KEY="quarkdown:$OBSERVED_TAG"
+          MARKER="<!-- scribium-upstream-drift:$ISSUE_KEY -->"
+
+          # Write issue body using printf to avoid heredoc issues
+          printf 'Supported baseline: %s\nObserved stable release: %s\nUpstream release URL: %s\nDetection source: scheduled upstream observer\n\n**Checklist:**\n- [ ] Review permitted public specification changes\n- [ ] Identify affected Scribium compatibility features\n- [ ] Add independently authored conformance cases\n- [ ] Perform black-box observations where necessary\n- [ ] Document known divergences\n- [ ] Implement required compatibility changes\n- [ ] Run full conformance suite\n- [ ] Update supported baseline only after verification\n\n**Clean-room warning:**\nDo not inspect or translate Quarkdown implementation source while resolving this issue.\n\n%s\n' "$SUPPORTED_BASELINE" "$OBSERVED_TAG" "$URL" "$MARKER" > "$RUNNER_TEMP/upstream-issue.md"
+
+          gh issue create \
+            --repo ${{ github.repository }} \
+            --title "[upstream] Quarkdown $OBSERVED_TAG detected (baseline $SUPPORTED_BASELINE)" \
+            --body-file "$RUNNER_TEMP/upstream-issue.md" \
+            --label "area:compatibility,type:compatibility,status:needs-decision"

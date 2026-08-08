@@ -1,0 +1,5 @@
+id = "call-indented-body-basic"
+feature = "indented-body"
+compatibility_level = "Parsed"
+specification_source = "quarkdown-function-call-syntax"
+description = "Block call with indented body argument"

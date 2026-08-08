@@ -5,6 +5,7 @@ members = [
     "crates/scribium-typst",
     "crates/scribium-cli",
     "crates/scribium-test-support",
+    "tools/upstream-watch",
 ]
 
 exclude = [

@@ -25,7 +25,21 @@ Core uses `VirtualProject` for all I/O — no filesystem access.
 
 **Dependencies:** None
 
+## M0.5 — Upstream Compatibility Infrastructure
+
+**Objective:** Detect Quarkdown upstream drift before compatibility implementation continues.
+
+| Item                                | Status       |
+|-------------------------------------|--------------|
+| Machine-readable upstream baseline  | Completed    |
+| Stable release observer             | Completed    |
+| Drift issue automation              | Completed    |
+| Conformance corpus foundation       | Completed    |
+
+**Dependencies:** M0
+
 ## M1 — Quarkdown-Compatible Vertical Slice
+
 **Status:** Completed
 
 **Objective:** First end-to-end `.qd → Typst → PDF` pipeline.
@@ -39,6 +53,7 @@ front matter, deterministic output.
 > to a later milestone and tracked separately.
 
 ## M2 — Quarkdown Core Language + Markdown MVP
+
 **Status:** In progress
 
 **Objective:** Production-ready Quarkdown core subset and Markdown baseline.
@@ -59,7 +74,7 @@ v0.1.0 release.
 
 ## M5 — Quarkdown Compatibility Expansion
 
-**Objective:** Expanded compatibility subset, matrix, conformance suite.
+**Objective:** Expand compatibility coverage and conformance corpus.
 
 ## M6 — Library API, LSP, WASM Bindings
 

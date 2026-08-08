@@ -1,0 +1,15 @@
+# Quarkdown Upstream Manifest
+# This file declares the supported baseline version for Scribium's Quarkdown compatibility.
+# It is used by automated tooling to detect upstream drift.
+# 
+# IMPORTANT: This file declares the SUPPORTED BASELINE, not the latest observed release.
+# The latest observed release is tracked separately by the upstream observer workflow.
+# Changing supported_baseline requires human-reviewed conformance evidence (see ADR-0013).
+
+schema_version = 1
+
+[upstream]
+id = "quarkdown"
+repository = "iamgio/quarkdown"
+release_channel = "stable"
+supported_baseline = "v2.5.0"

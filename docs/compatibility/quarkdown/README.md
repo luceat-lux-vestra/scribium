@@ -193,6 +193,43 @@ accessed dates.
   block content. This behavior may be refined if upstream semantics are
   clarified. See `docs/SYNTAX.md` for details.
 
+## Upstream Baseline Management
+
+Scribium's Quarkdown compatibility is tracked against a **supported baseline** version,
+which is distinct from the **latest observed upstream release**.
+
+### Baseline vs. Observed
+
+| Concept | Description | Authority |
+|---------|-------------|-----------|
+| **Supported baseline** | The Quarkdown version Scribium claims compatibility with. Recorded in `upstream.toml`. | Human-reviewed PR only |
+| **Latest observed** | The latest stable Quarkdown release detected by the automated observer. | Automated daily check |
+
+The automated observer (`.github/workflows/upstream-quarkdown.yml`) runs daily and compares the latest stable release against the supported baseline:
+
+- If they match → `current` status, no action
+- If they differ → `drift` status, a GitHub Issue is created with a checklist for compatibility investigation
+
+**Crucially:** The observer **never** updates the supported baseline. A baseline change requires:
+1. Review of permitted public specification changes
+2. Independently authored conformance cases
+3. Black-box observations where necessary
+4. Implementation of required compatibility changes
+5. Full conformance suite pass
+6. Documentation of known divergences
+7. Human-reviewed PR updating `upstream.toml` and this compatibility matrix
+
+See `docs/adr/0013-upstream-compatibility-observation-and-baseline-promotion.md` for the full decision record.
+
+### Why the Compatibility Matrix Does Not Auto-Update
+
+A new upstream release may add, change, or remove features. The compatibility matrix reflects only what Scribium has **independently verified** through:
+- Public specification review
+- Independently authored conformance tests
+- Black-box behavioral observation (where permitted)
+
+Automatic updates would conflate "upstream released something" with "Scribium implements it correctly" — which violates the clean-room policy and the principle that compatibility claims require evidence.
+
 ## Features Outside the Contract
 
 The following are not part of the documented subset and are not claimed:
