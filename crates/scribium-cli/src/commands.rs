@@ -233,9 +233,7 @@ fn collect_project_files(
 
 /// Compiles a pre-loaded VirtualProject.
 fn compile_project(project: &VirtualProject) -> anyhow::Result<scribium_core::CompileResult> {
-    let options = scribium_core::CompileOptions {
-        compatibility_profile: None,
-    };
+    let options = scribium_core::CompileOptions::default();
     Ok(scribium_core::compile(project, &options))
 }
 /// Returns an error if any diagnostic has Severity::Error.

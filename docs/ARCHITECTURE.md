@@ -1055,9 +1055,8 @@ backend = "subprocess" # illustrative host-level backend selection
 [resources]
 max_source_size = "10MB" # illustrative value
 max_include_depth = 16 # illustrative value
-max_evaluation_steps = 100000 # illustrative value
-max_loop_iterations = 10000 # illustrative value
-max_recursion_depth = 64 # illustrative value
+max_materialized_elements = 1000000 # R10 evaluator default
+max_evaluation_depth = 256 # R10 evaluator default
 
 [compatibility]
 profile = "quarkdown-v2.5" # illustrative profile value
@@ -1096,6 +1095,35 @@ or subprocess configuration does not belong in `scribium-engine` or another
 platform-independent compiler crate. `VirtualProject` does not select a
 native backend executable.
 
+### R10 evaluator resource budgets
+
+`scribium-engine` owns two typed, immutable limits selected for one
+compilation through `scribium-core::CompileOptions::evaluation_limits`:
+
+- `max_materialized_elements` defaults to `1_000_000` and is a per-operation
+  maximum. Closed and left-open finite ranges, `.repeat`, collection/list/
+  dictionary iterable adaptation, and collection transform result
+  construction check this limit before reserving their result vectors. A
+  repeated independent operation receives the full per-operation allowance.
+- `max_evaluation_depth` defaults to `256` active evaluator frames. Entering
+  central call dispatch or a callback invocation consumes one frame; a scoped
+  guard releases it on every return path, including a diagnostic failure.
+  This covers nested user functions, direct/indirect recursion, components,
+  includes, and callback evaluation without evaluating lazy bodies early.
+
+Closed ranges compute their inclusive cardinality with checked integer
+arithmetic, compare that cardinality to `max_materialized_elements`, and only
+then convert to `usize`, reserve, and iterate. Descending ranges retain their
+existing empty semantics. Limit failures use the stable evaluator diagnostic
+code `E3005` and the initiating source span.
+
+R10 intentionally does not add aggregate output budgeting. The evaluator has
+several existing observable output boundaries (`IrValue::Content`, block and
+inline materialization, and backend-neutral document nodes), so there is no
+single deterministic ownership point for an aggregate output quantity without
+changing semantic ownership. That policy is deferred rather than represented
+by a vague operation counter.
+
 ADR-0008 requires output-target selection, but backend capability is not a
 fixed architecture-wide list. Users may request output targets through
 configuration or CLI flags; the selected Typst compiler backend determines
@@ -1111,9 +1139,10 @@ configuration is defined here; additional backend/compiler-resource fields
 require their own accepted contract.
 
 Resource-limit concepts remain part of configuration, including source/input
-size, include depth, evaluation steps, loop iterations, and recursion depth.
-The numeric values in the example are not permanent API guarantees unless
-established elsewhere. Each limit is enforced by the stage that performs the
+size and include depth for their respective host/project boundaries. R10
+establishes the typed evaluator limits described above; aggregate output
+budgeting remains deferred because the current evaluator has no single clean
+accounting point. Each limit is enforced by the stage that performs the
 bounded operation:
 
 ```text
@@ -1121,9 +1150,7 @@ source/input size
     -> project/host ingestion boundary
 include/project traversal limits
     -> responsible project/host or compiler stage
-evaluation steps
-loop iterations
-recursion depth
+finite materialized elements and active evaluator depth
     -> scribium-engine
 ```
 

@@ -47,7 +47,8 @@ use crate::value_conversion::{
 };
 use crate::{ast_to_ir, builtins};
 use crate::{
-    Capabilities, Capability, IncludedSource, ResourceAccessError, ResourceProvider, ResourceText,
+    Capabilities, Capability, EvaluationLimits, IncludedSource, ResourceAccessError,
+    ResourceProvider, ResourceText,
 };
 use scribium_diagnostics::{Diagnostic, Severity};
 use scribium_ir::{
@@ -582,6 +583,24 @@ fn ir_node_source_span(node: &IrNode) -> SourceSpan {
     }
 }
 
+#[derive(Debug, Default)]
+struct EvaluationRuntime {
+    active_evaluation_depth: usize,
+}
+
+/// Releases one active evaluator frame even when evaluation returns early.
+struct EvaluationDepthGuard {
+    runtime: Rc<RefCell<EvaluationRuntime>>,
+}
+
+impl Drop for EvaluationDepthGuard {
+    fn drop(&mut self) {
+        let mut runtime = self.runtime.borrow_mut();
+        debug_assert!(runtime.active_evaluation_depth > 0);
+        runtime.active_evaluation_depth = runtime.active_evaluation_depth.saturating_sub(1);
+    }
+}
+
 /// Evaluation context with explicit parent visibility and local bindings.
 ///
 /// Created fresh per `evaluate()` call to ensure isolation and determinism.
@@ -589,7 +608,7 @@ fn ir_node_source_span(node: &IrNode) -> SourceSpan {
 /// the visible parent context at creation time and local writes stay in the
 /// child. The snapshot is deliberate: a lambda observes the bindings visible
 /// when it is entered, while its local declarations cannot leak back.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct EvaluationContext<'a> {
     parent: Option<Box<EvaluationContext<'a>>>,
     variables: BTreeMap<String, VariableValue>,
@@ -600,11 +619,29 @@ struct EvaluationContext<'a> {
     current_source: Option<SourceId>,
     active_sources: Vec<SourceId>,
     document_state: Rc<RefCell<DocumentState>>,
+    limits: EvaluationLimits,
+    runtime: Rc<RefCell<EvaluationRuntime>>,
 }
 
 impl<'a> EvaluationContext<'a> {
     fn new() -> Self {
-        Self::default()
+        Self::with_limits(EvaluationLimits::default())
+    }
+
+    fn with_limits(limits: EvaluationLimits) -> Self {
+        Self {
+            parent: None,
+            variables: BTreeMap::new(),
+            functions: BTreeMap::new(),
+            lambda_scope: None,
+            resources: None,
+            metadata_defaults: crate::DocumentMetadataDefaults::default(),
+            current_source: None,
+            active_sources: Vec::new(),
+            document_state: Rc::new(RefCell::new(DocumentState::default())),
+            limits,
+            runtime: Rc::new(RefCell::new(EvaluationRuntime::default())),
+        }
     }
 
     /// Creates a child scope with parent-visible bindings and isolated locals.
@@ -620,6 +657,8 @@ impl<'a> EvaluationContext<'a> {
             current_source: self.current_source,
             active_sources: self.active_sources.clone(),
             document_state: Rc::clone(&self.document_state),
+            limits: self.limits,
+            runtime: Rc::clone(&self.runtime),
         }
     }
 
@@ -627,14 +666,35 @@ impl<'a> EvaluationContext<'a> {
         resources: &'a dyn ResourceProvider,
         source_id: SourceId,
         metadata_defaults: &crate::DocumentMetadataDefaults,
+        limits: EvaluationLimits,
     ) -> Self {
         Self {
             resources: Some(resources),
             metadata_defaults: metadata_defaults.clone(),
             current_source: Some(source_id),
             active_sources: vec![source_id],
-            ..Self::new()
+            ..Self::with_limits(limits)
         }
+    }
+
+    fn enter_evaluation_depth(
+        &self,
+        span: SourceSpan,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Result<EvaluationDepthGuard, CallOutcome> {
+        let mut runtime = self.runtime.borrow_mut();
+        if runtime.active_evaluation_depth >= self.limits.max_evaluation_depth {
+            diagnostics.push(evaluation_depth_limit_error(
+                self.limits.max_evaluation_depth,
+                span,
+            ));
+            return Err(CallOutcome::Failed);
+        }
+        runtime.active_evaluation_depth += 1;
+        drop(runtime);
+        Ok(EvaluationDepthGuard {
+            runtime: Rc::clone(&self.runtime),
+        })
     }
 
     /// Declares or reassigns a variable from an evaluated IrValue, preserving content semantics.
@@ -742,6 +802,8 @@ impl<'a> EvaluationContext<'a> {
             current_source: None,
             active_sources: Vec::new(),
             document_state: Rc::clone(&caller_context.document_state),
+            limits: caller_context.limits,
+            runtime: Rc::clone(&caller_context.runtime),
         }
     }
 
@@ -871,6 +933,7 @@ impl<'a> EvaluationContext<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct Evaluator {
     capabilities: Capabilities,
+    limits: EvaluationLimits,
 }
 
 impl Default for Evaluator {
@@ -882,12 +945,29 @@ impl Default for Evaluator {
 impl Evaluator {
     /// Creates a new evaluator.
     pub fn new() -> Self {
-        Self::with_capabilities(Capabilities::default())
+        Self::with_capabilities_and_limits(Capabilities::default(), EvaluationLimits::default())
     }
 
     /// Creates an evaluator with the explicit capabilities for one compile.
     pub fn with_capabilities(capabilities: Capabilities) -> Self {
-        Self { capabilities }
+        Self::with_capabilities_and_limits(capabilities, EvaluationLimits::default())
+    }
+
+    /// Creates an evaluator with explicit semantic resource limits.
+    pub fn with_limits(limits: EvaluationLimits) -> Self {
+        Self::with_capabilities_and_limits(Capabilities::default(), limits)
+    }
+
+    /// Creates an evaluator with explicit capabilities and semantic resource
+    /// limits for one compilation.
+    pub fn with_capabilities_and_limits(
+        capabilities: Capabilities,
+        limits: EvaluationLimits,
+    ) -> Self {
+        Self {
+            capabilities,
+            limits,
+        }
     }
 
     /// Evaluates the document, resolving conditionals, variables, and chains.
@@ -895,7 +975,7 @@ impl Evaluator {
     /// Returns the resolved document and any evaluation diagnostics.
     pub fn evaluate(&self, document: &IrDocument) -> (IrDocument, Vec<Diagnostic>) {
         let mut diagnostics = Vec::new();
-        let mut context = EvaluationContext::new();
+        let mut context = EvaluationContext::with_limits(self.limits);
         self.evaluate_with_context(document, &mut diagnostics, &mut context)
     }
 
@@ -913,6 +993,7 @@ impl Evaluator {
             resources,
             source_id,
             &crate::DocumentMetadataDefaults::default(),
+            self.limits,
         );
         self.evaluate_with_context(document, &mut diagnostics, &mut context)
     }
@@ -927,7 +1008,7 @@ impl Evaluator {
     ) -> (IrDocument, Vec<Diagnostic>) {
         let mut diagnostics = Vec::new();
         let mut context =
-            EvaluationContext::with_resources(resources, source_id, metadata_defaults);
+            EvaluationContext::with_resources(resources, source_id, metadata_defaults, self.limits);
         self.evaluate_with_context(document, &mut diagnostics, &mut context)
     }
 
@@ -1395,6 +1476,10 @@ impl Evaluator {
         context: &mut EvaluationContext<'_>,
         first_origin: Option<ValueOrigin>,
     ) -> CallOutcome {
+        let _depth = match context.enter_evaluation_depth(*span, diagnostics) {
+            Ok(depth) => depth,
+            Err(outcome) => return outcome,
+        };
         if let Some(result) = context.get_implicit_parameter(name) {
             return match result {
                 Ok(value) => CallOutcome::Value(value),
@@ -3400,6 +3485,7 @@ impl Evaluator {
                 return Err(CallOutcome::Failed);
             }
         };
+        self.check_materialized_elements_len(list.len(), span, diagnostics)?;
         let mut entries = Vec::new();
         if let Err(error) = entries.try_reserve_exact(list.len()) {
             diagnostics.push(iteration_error(
@@ -4162,6 +4248,10 @@ impl Evaluator {
         diagnostics: &mut Vec<Diagnostic>,
         caller_context: &EvaluationContext<'_>,
     ) -> CallOutcome {
+        let _depth = match caller_context.enter_evaluation_depth(options.span, diagnostics) {
+            Ok(depth) => depth,
+            Err(outcome) => return outcome,
+        };
         let bound = match bind_invocation_arguments(
             callable.parameters.as_deref(),
             arguments,
@@ -4187,7 +4277,7 @@ impl Evaluator {
             .capture
             .as_deref()
             .map(EvaluationContext::from_capture)
-            .unwrap_or_default();
+            .unwrap_or_else(EvaluationContext::new);
         // Preserve the definition snapshot as the lexical base, then add only
         // caller-visible lookup bindings. Invocation parameters are installed
         // in the child below, after both layers, so they have highest
@@ -4232,6 +4322,11 @@ impl Evaluator {
         diagnostics: &mut Vec<Diagnostic>,
         context: &mut EvaluationContext<'_>,
     ) -> CallOutcome {
+        if let Err(outcome) =
+            self.check_materialized_elements_len(elements.len(), options.span, diagnostics)
+        {
+            return outcome;
+        }
         let mut results = Vec::new();
         if let Err(error) = results.try_reserve_exact(elements.len()) {
             diagnostics.push(iteration_error(
@@ -4268,6 +4363,11 @@ impl Evaluator {
         diagnostics: &mut Vec<Diagnostic>,
         context: &mut EvaluationContext<'_>,
     ) -> CallOutcome {
+        if let Err(outcome) =
+            self.check_materialized_elements_len(elements.len(), span, diagnostics)
+        {
+            return outcome;
+        }
         let mut results = Vec::new();
         if let Err(error) = results.try_reserve_exact(elements.len()) {
             diagnostics.push(iteration_error(
@@ -4317,6 +4417,11 @@ impl Evaluator {
         diagnostics: &mut Vec<Diagnostic>,
         context: &mut EvaluationContext<'_>,
     ) -> CallOutcome {
+        if let Err(outcome) =
+            self.check_materialized_elements_len(elements.len(), span, diagnostics)
+        {
+            return outcome;
+        }
         let mut keyed = Vec::new();
         if let Err(error) = keyed.try_reserve_exact(elements.len()) {
             diagnostics.push(iteration_error(
@@ -4390,8 +4495,12 @@ impl Evaluator {
     ) -> Result<Vec<IrValue>, CallOutcome> {
         let InvocationValue { value, origin } = value;
         match value {
-            IrValue::Collection(values) => Ok(values),
+            IrValue::Collection(values) => {
+                self.check_materialized_elements_len(values.len(), *span, diagnostics)?;
+                Ok(values)
+            }
             IrValue::Pair(pair) => {
+                self.check_materialized_elements_len(2, pair.span, diagnostics)?;
                 let mut values = Vec::new();
                 if let Err(error) = values.try_reserve_exact(2) {
                     diagnostics.push(iteration_error(
@@ -4405,6 +4514,11 @@ impl Evaluator {
                 Ok(values)
             }
             IrValue::Dictionary(dictionary) => {
+                self.check_materialized_elements_len(
+                    dictionary.entries.len(),
+                    dictionary.span,
+                    diagnostics,
+                )?;
                 let mut values = Vec::new();
                 if let Err(error) = values.try_reserve_exact(dictionary.entries.len()) {
                     diagnostics.push(iteration_error(
@@ -4433,6 +4547,7 @@ impl Evaluator {
             }
             IrValue::Content(nodes) => match nodes.as_slice() {
                 [IrNode::UnorderedList { items, .. }] | [IrNode::OrderedList { items, .. }] => {
+                    self.check_materialized_elements_len(items.len(), *span, diagnostics)?;
                     let mut values = Vec::new();
                     if let Err(error) = values.try_reserve_exact(items.len()) {
                         diagnostics.push(iteration_error(
@@ -4488,6 +4603,40 @@ impl Evaluator {
         }
     }
 
+    fn check_materialized_elements(
+        &self,
+        requested: u64,
+        span: SourceSpan,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Result<usize, CallOutcome> {
+        let limit = self.limits.max_materialized_elements as u64;
+        if requested > limit {
+            diagnostics.push(materialized_elements_limit_error(
+                requested,
+                self.limits.max_materialized_elements,
+                span,
+            ));
+            return Err(CallOutcome::Failed);
+        }
+        usize::try_from(requested).map_err(|_| {
+            diagnostics.push(iteration_error(
+                "Materialized element count is too large for this target".to_string(),
+                span,
+            ));
+            CallOutcome::Failed
+        })
+    }
+
+    fn check_materialized_elements_len(
+        &self,
+        requested: usize,
+        span: SourceSpan,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Result<(), CallOutcome> {
+        self.check_materialized_elements(requested as u64, span, diagnostics)
+            .map(|_| ())
+    }
+
     fn materialize_range(
         &self,
         range: IrRange,
@@ -4541,13 +4690,7 @@ impl Evaluator {
             ));
             return Err(CallOutcome::Failed);
         };
-        let Ok(capacity) = usize::try_from(count) else {
-            diagnostics.push(iteration_error(
-                "Closed Range is too large to materialize on this target".to_string(),
-                range.span,
-            ));
-            return Err(CallOutcome::Failed);
-        };
+        let capacity = self.check_materialized_elements(count as u64, range.span, diagnostics)?;
         let mut values = Vec::new();
         if let Err(error) = values.try_reserve_exact(capacity) {
             diagnostics.push(iteration_error(
@@ -7914,6 +8057,38 @@ fn iteration_error_at(message: String, span: SourceSpan) -> Diagnostic {
     }
 }
 
+fn materialized_elements_limit_error(requested: u64, limit: usize, span: SourceSpan) -> Diagnostic {
+    Diagnostic {
+        code: "E3005".to_string(),
+        severity: Severity::Error,
+        message: format!(
+            "materialized element limit exceeded: requested {requested}, maximum is {limit}"
+        ),
+        primary: Some(span),
+        secondary: Vec::new(),
+        hints: vec![
+            "Reduce the size of this range or iterable, or configure a higher evaluator materialization limit."
+                .to_string(),
+        ],
+    }
+}
+
+fn evaluation_depth_limit_error(limit: usize, span: SourceSpan) -> Diagnostic {
+    Diagnostic {
+        code: "E3005".to_string(),
+        severity: Severity::Error,
+        message: format!(
+            "evaluation depth limit exceeded: maximum is {limit} active evaluator frame(s)"
+        ),
+        primary: Some(span),
+        secondary: Vec::new(),
+        hints: vec![
+            "Reduce recursive or nested function/callback evaluation, or configure a higher evaluator depth limit."
+                .to_string(),
+        ],
+    }
+}
+
 fn stacked_inline_materialization_error(span: SourceSpan) -> Diagnostic {
     Diagnostic {
         code: "E3001".to_string(),
@@ -9717,6 +9892,166 @@ mod tests {
         assert!(matches!(result, Err(CallOutcome::Failed)));
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].primary, Some(span(10, 13)));
+    }
+
+    #[test]
+    fn materialization_limit_is_checked_before_range_allocation() {
+        let evaluator = Evaluator::with_limits(EvaluationLimits {
+            max_materialized_elements: 3,
+            max_evaluation_depth: 256,
+        });
+
+        let mut diagnostics = Vec::new();
+        let at_limit = evaluator
+            .coerce_iterable(
+                InvocationValue::static_value(IrValue::Range(IrRange {
+                    start: Some(1),
+                    end: Some(3),
+                    span: span(10, 15),
+                })),
+                &span(0, 20),
+                &mut diagnostics,
+            )
+            .expect("the exact materialization limit is valid");
+        assert_eq!(at_limit.len(), 3);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        let repeated_independent = evaluator
+            .coerce_iterable(
+                InvocationValue::static_value(IrValue::Range(IrRange {
+                    start: Some(10),
+                    end: Some(12),
+                    span: span(30, 35),
+                })),
+                &span(0, 40),
+                &mut diagnostics,
+            )
+            .expect("per-operation limits reset for an independent range");
+        assert_eq!(repeated_independent.len(), 3);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        let mut diagnostics = Vec::new();
+        let over_limit = evaluator.coerce_iterable(
+            InvocationValue::static_value(IrValue::Range(IrRange {
+                start: Some(1),
+                end: Some(4),
+                span: span(50, 55),
+            })),
+            &span(0, 60),
+            &mut diagnostics,
+        );
+        assert!(matches!(over_limit, Err(CallOutcome::Failed)));
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "E3005");
+        assert_eq!(
+            diagnostics[0].message,
+            "materialized element limit exceeded: requested 4, maximum is 3"
+        );
+        assert_eq!(diagnostics[0].primary, Some(span(50, 55)));
+
+        let mut diagnostics = Vec::new();
+        let huge = evaluator.coerce_iterable(
+            InvocationValue::static_value(IrValue::Range(IrRange {
+                start: Some(i32::MIN),
+                end: Some(i32::MAX),
+                span: span(70, 80),
+            })),
+            &span(0, 90),
+            &mut diagnostics,
+        );
+        assert!(matches!(huge, Err(CallOutcome::Failed)));
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "E3005");
+        assert_eq!(diagnostics[0].primary, Some(span(70, 80)));
+    }
+
+    #[test]
+    fn descending_empty_range_passes_even_when_materialization_limit_is_zero() {
+        let evaluator = Evaluator::with_limits(EvaluationLimits {
+            max_materialized_elements: 0,
+            max_evaluation_depth: 256,
+        });
+        let mut diagnostics = Vec::new();
+        let values = evaluator
+            .coerce_iterable(
+                InvocationValue::static_value(IrValue::Range(IrRange {
+                    start: Some(3),
+                    end: Some(1),
+                    span: span(0, 4),
+                })),
+                &span(0, 4),
+                &mut diagnostics,
+            )
+            .expect("descending ranges retain their empty semantics");
+        assert!(values.is_empty());
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    fn function_declaration(name: &str, body: Vec<IrNode>, start: usize) -> IrNode {
+        IrNode::FunctionDeclaration {
+            name: IrValue::Identifier(name.to_string()),
+            parameters: Vec::new(),
+            body,
+            span: span(start, start + name.len()),
+        }
+    }
+
+    fn function_call(name: &str, start: usize) -> IrNode {
+        IrNode::FunctionCall {
+            name: name.to_string(),
+            positional_args: Vec::new(),
+            named_args: Vec::new(),
+            lambda_parameters: None,
+            body: None,
+            span: span(start, start + name.len()),
+        }
+    }
+
+    #[test]
+    fn nested_function_evaluation_at_depth_limit_passes() {
+        let evaluator = Evaluator::with_limits(EvaluationLimits {
+            max_materialized_elements: 16,
+            max_evaluation_depth: 2,
+        });
+        let document = doc(vec![
+            function_declaration("outer", vec![function_call("inner", 20)], 0),
+            function_declaration("inner", vec![text_paragraph("ok")], 10),
+            function_call("outer", 30),
+        ]);
+
+        let (result, diagnostics) = evaluator.evaluate(&document);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_paragraph_text(&result.nodes, "ok");
+    }
+
+    #[test]
+    fn direct_and_indirect_recursion_fail_at_depth_limit_and_restore_siblings() {
+        let evaluator = Evaluator::with_limits(EvaluationLimits {
+            max_materialized_elements: 16,
+            max_evaluation_depth: 3,
+        });
+        let direct = doc(vec![
+            function_declaration("loop", vec![function_call("loop", 10)], 0),
+            function_call("loop", 20),
+            var_declaration("after", IrValue::String("usable".to_string())),
+            var_ref("after"),
+        ]);
+        let (direct_result, direct_diagnostics) = evaluator.evaluate(&direct);
+        assert_eq!(direct_diagnostics.len(), 1, "{direct_diagnostics:?}");
+        assert_eq!(direct_diagnostics[0].code, "E3005");
+        assert_eq!(direct_diagnostics[0].primary, Some(span(10, 14)));
+        assert_paragraph_text(&direct_result.nodes, "usable");
+
+        let indirect = doc(vec![
+            function_declaration("first", vec![function_call("second", 40)], 30),
+            function_declaration("second", vec![function_call("first", 50)], 45),
+            function_call("first", 60),
+        ]);
+        let (indirect_result, indirect_diagnostics) = evaluator.evaluate(&indirect);
+        assert!(indirect_result.nodes.is_empty());
+        assert_eq!(indirect_diagnostics.len(), 1, "{indirect_diagnostics:?}");
+        assert_eq!(indirect_diagnostics[0].code, "E3005");
+        assert_eq!(indirect_diagnostics[0].primary, Some(span(40, 46)));
     }
 
     #[test]

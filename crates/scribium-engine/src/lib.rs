@@ -10,6 +10,36 @@ pub mod builtins;
 pub mod evaluator;
 pub(crate) mod value_conversion;
 
+/// Deterministic semantic resource limits for one evaluator compilation.
+///
+/// `max_materialized_elements` is a per-operation bound: every finite range
+/// or iterable/materialization operation may produce at most this many
+/// elements. `max_evaluation_depth` bounds active evaluator call and callback
+/// frames for one compilation. These limits are semantic, platform-neutral,
+/// and independent of host process or allocator behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvaluationLimits {
+    /// Maximum number of elements produced by one finite materialization
+    /// operation, including closed-range materialization.
+    pub max_materialized_elements: usize,
+    /// Maximum number of active evaluator call/callback frames.
+    pub max_evaluation_depth: usize,
+}
+
+impl Default for EvaluationLimits {
+    fn default() -> Self {
+        Self {
+            // Existing fixtures and ordinary documents are far below this
+            // bound, while a document cannot silently request an unbounded
+            // range allocation.
+            max_materialized_elements: 1_000_000,
+            // This leaves ample room for ordinary nested components and
+            // functions without relying on the native thread stack size.
+            max_evaluation_depth: 256,
+        }
+    }
+}
+
 /// The closed evaluator capability set used by the compatibility pipeline.
 ///
 /// This is deliberately narrow: granting native content authorizes creation

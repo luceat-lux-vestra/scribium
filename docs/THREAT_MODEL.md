@@ -16,9 +16,9 @@ vulnerabilities (report to Typst GmbH).
 | T4 | Malicious image or font     | Process              | Malicious doc     | Asset loading  | Typst compiler handles              | Low (inherited) |
 | T5 | Decompression bomb          | Memory               | Malicious doc     | Asset loading  | Max file size, format validation    | Medium        |
 | T6 | Deep nesting (AST)          | Memory               | Malicious doc     | Parser         | Max nesting depth                   | Low           |
-| T7 | Exponential expansion       | CPU / Memory         | Malicious doc     | Evaluator      | Max evaluation steps                | Medium        |
-| T8 | Infinite recursion          | CPU / Stack          | Malicious doc     | Evaluator      | Max recursion depth                  | Low           |
-| T9 | Large loop count            | CPU                  | Malicious doc     | Evaluator      | Max loop iterations                 | Low           |
+| T7 | Exponential expansion       | CPU / Memory         | Malicious doc     | Evaluator      | Per-operation materialization bound; aggregate output remains deferred | Medium |
+| T8 | Infinite recursion          | CPU / Stack          | Malicious doc     | Evaluator      | Scoped active evaluator-depth bound | Low           |
+| T9 | Large loop count            | CPU                  | Malicious doc     | Evaluator      | Per-operation materialized-element bound | Low           |
 | T10 | Hostile regex               | CPU                  | Malicious doc     | Evaluator      | No user-provided regex in core      | Low           |
 | T11 | Environment leakage         | Secrets              | Malicious doc     | Evaluator      | Environment access disabled by def  | Low           |
 | T12 | Arbitrary shell execution   | System               | Malicious doc     | Evaluator      | No shell execution                  | None (blocked) |
@@ -73,9 +73,8 @@ directory symlink escapes are rejected.
 | Max source size          | 10 MB          | 100 MB     |
 | Max include depth        | 16             | 64         |
 | Max AST nodes            | 100,000        | 1,000,000  |
-| Max evaluation steps     | 100,000        | 1,000,000  |
-| Max loop iterations      | 10,000         | 100,000    |
-| Max recursion depth      | 64             | 256        |
+| Max materialized elements per evaluator operation | 1,000,000 | typed `usize` |
+| Max active evaluator depth | 256 | typed `usize` |
 | Max generated Typst size | 10 MB          | 100 MB     |
 | Max asset size           | 5 MB           | 50 MB      |
 | Compile timeout          | 60s            | 300s       |

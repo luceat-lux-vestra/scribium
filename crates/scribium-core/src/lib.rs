@@ -17,7 +17,7 @@ pub mod source_map;
 pub use scribium_engine::builtins;
 pub mod evaluator {
     use crate::engine_adapter::VirtualProjectResourceProvider;
-    use crate::{Capabilities, VirtualProject};
+    use crate::{Capabilities, EvaluationLimits, VirtualProject};
     use scribium_diagnostics::Diagnostic;
     use scribium_engine::evaluator as engine_evaluator;
     use scribium_ir::IrDocument;
@@ -47,6 +47,27 @@ pub mod evaluator {
         pub fn with_capabilities(capabilities: Capabilities) -> Self {
             Self {
                 inner: engine_evaluator::Evaluator::with_capabilities(capabilities),
+            }
+        }
+
+        /// Creates an evaluator with explicit semantic resource limits.
+        pub fn with_limits(limits: EvaluationLimits) -> Self {
+            Self {
+                inner: engine_evaluator::Evaluator::with_limits(limits),
+            }
+        }
+
+        /// Creates an evaluator with explicit capabilities and semantic
+        /// resource limits for one compilation.
+        pub fn with_capabilities_and_limits(
+            capabilities: Capabilities,
+            limits: EvaluationLimits,
+        ) -> Self {
+            Self {
+                inner: engine_evaluator::Evaluator::with_capabilities_and_limits(
+                    capabilities,
+                    limits,
+                ),
             }
         }
 
@@ -136,7 +157,7 @@ pub use scribium_diagnostics as diagnostics;
 pub use scribium_diagnostics::{Diagnostic, Severity};
 pub use source::*;
 // Compatibility facade: implementation ownership lives in scribium-project.
-pub use scribium_engine::{Capabilities, Capability};
+pub use scribium_engine::{Capabilities, Capability, EvaluationLimits};
 pub use scribium_project::{BuildError, ProjectMetadata, VirtualProject, VirtualProjectBuilder};
 
 /// The Scribium core result type.
@@ -184,7 +205,7 @@ pub fn compile(
 /// Compile a Scribium project with an explicit evaluator capability set.
 pub fn compile_with_capabilities(
     project: &scribium_project::VirtualProject,
-    _options: &CompileOptions,
+    options: &CompileOptions,
     capabilities: Capabilities,
 ) -> CompileResult {
     let entry = project.entry();
@@ -226,8 +247,9 @@ pub fn compile_with_capabilities(
         source_mode,
     );
     let resource_provider = engine_adapter::VirtualProjectResourceProvider::new(project);
-    let (ir, evaluation_diagnostics) = evaluator::Evaluator::with_capabilities(capabilities)
-        .evaluate_with_resources(&resource_provider, source_id, &ir, &metadata_defaults);
+    let (ir, evaluation_diagnostics) =
+        evaluator::Evaluator::with_capabilities_and_limits(capabilities, options.evaluation_limits)
+            .evaluate_with_resources(&resource_provider, source_id, &ir, &metadata_defaults);
     let mut diagnostics: Vec<Diagnostic> = parsed
         .diagnostics
         .into_iter()
@@ -253,6 +275,8 @@ pub fn compile_with_capabilities(
 #[derive(Debug, Clone, Default)]
 pub struct CompileOptions {
     pub compatibility_profile: Option<String>,
+    /// Semantic evaluator limits applied to this compilation.
+    pub evaluation_limits: EvaluationLimits,
 }
 
 /// Result of compilation through the frontend.
@@ -265,7 +289,10 @@ pub struct CompileResult {
 #[cfg(test)]
 mod tests {
     use crate::ir::{IrInline, IrNode};
-    use crate::{CompileOptions, Severity, SourceMode, VirtualPathBuf, VirtualProjectBuilder};
+    use crate::{
+        CompileOptions, EvaluationLimits, Severity, SourceMode, VirtualPathBuf,
+        VirtualProjectBuilder,
+    };
     #[test]
     fn it_compiles_empty_document() {
         let project = VirtualProjectBuilder::new()
@@ -279,17 +306,54 @@ mod tests {
             &project,
             &CompileOptions {
                 compatibility_profile: None,
+                evaluation_limits: EvaluationLimits::default(),
             },
         );
         assert!(result.ir.nodes.is_empty());
     }
 
     #[test]
-    fn old_compile_options_struct_literal_remains_source_compatible() {
+    fn compile_options_default_uses_documented_evaluation_limits() {
         let options = CompileOptions {
             compatibility_profile: None,
+            evaluation_limits: EvaluationLimits::default(),
         };
         assert!(options.compatibility_profile.is_none());
+        assert_eq!(options.evaluation_limits, EvaluationLimits::default());
+    }
+
+    #[test]
+    fn compile_propagates_evaluation_limits_to_the_engine() {
+        let project = VirtualProjectBuilder::new()
+            .entry("main.qd")
+            .expect("valid path")
+            .add_source("main.qd", ".range {1} {3}::size\n")
+            .expect("valid path")
+            .build()
+            .unwrap();
+        let result = super::compile(
+            &project,
+            &CompileOptions {
+                compatibility_profile: None,
+                evaluation_limits: EvaluationLimits {
+                    max_materialized_elements: 2,
+                    max_evaluation_depth: 16,
+                },
+            },
+        );
+
+        assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
+        assert_eq!(result.diagnostics[0].code, "E3005");
+        assert!(result.diagnostics[0]
+            .message
+            .contains("materialized element limit exceeded"));
+        assert_eq!(
+            result.diagnostics[0]
+                .primary
+                .as_ref()
+                .map(|span| span.source_id),
+            Some(crate::SourceId(1))
+        );
     }
 
     #[test]

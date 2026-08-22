@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Evaluator resource budgets (R10):** `scribium-engine` now applies typed,
+  deterministic per-operation materialization and per-compilation evaluator
+  depth limits. Closed-range cardinality is checked before conversion,
+  reservation, or iteration; recursive/callback frames use scoped accounting;
+  failures report source-backed `E3005` diagnostics. Defaults are 1,000,000
+  materialized elements per operation and 256 active evaluator frames.
+
 - **Quarkdown project-backed resource builtins (M2):** `.read`, `.json`, and
   `.include` now operate through the in-memory `VirtualProject`, with
   source-relative nested resolution, recursive typed JSON values, active-stack
